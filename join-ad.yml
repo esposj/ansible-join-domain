@@ -1,0 +1,192 @@
+# vim:ft=ansible:
+# # Configure a RHEL/CentOS 6.6+ server for AD authentication against a Windows Domain
+
+#Todo List
+# - comprehensive network checks to make sure ports are open before beginning
+
+
+- hosts: all
+  vars_prompt:
+  # Typical answer is 'emaildomain.com' and this is used in the krb5.conf file
+    - name: DOMAIN
+      prompt: "Customers domain or subdomain (for kerberos)"
+      private: no
+        
+  # Typical answer is all caps WORKGROUP (ie. the AD domain name w/o the suf)
+    - name: WORKGROUP
+      prompt: "Customers Workgroup (All caps): (press enter for magic default of the above variable up to the first . in all caps)"
+      default: 'magic'
+      private: no
+
+  # Typical answer is  WORKGROUP.COM
+    - name: ADDOMAIN
+      prompt: "Customers Domain (All caps) DEFAULT: (press enter for magic default of the prior entered domain in all caps)"
+      default: 'magic'
+      private: no
+
+# I had to use user@WORKGROUP.COM to be sucessful
+    - name: JOINACCT
+      prompt: "Username for domain join (ADDOMAIN will be appended)"
+      private: no
+
+# CASE SENSITIVE
+    - name: JOINPWD
+      prompt: "Password for domain join"
+      private: yes
+
+# These are the DNS Servers for the customer domain (The domain controllers). 
+    - name: DNSSERVER1
+      prompt: Enter the first DNS Server
+      private: no
+    - name: DNSSERVER2
+      prompt: Enter the second DNS Server
+      private: no
+
+# Some may want to configure sssd enumeration but we will disable it by default
+# ref: https://fedorahosted.org/sssd/wiki/FAQ#WhenshouldIenableenumerationinSSSDorWhyisenumerationdisabledbydefault
+    - name: ENUMERATE
+      prompt: Configure sssd enumeration y/n?
+      default: 'n'
+      private: no
+
+# By default, we won't update any config if this device is already domain joined
+# but allow this to be overridden
+    - name: JOINAGAIN
+      prompt: "Continue if device is already domain joined? y/n"
+      default: "n"
+      private: no
+
+  vars:
+    location: false
+
+  tasks:
+  # If the hostname is more than 15 chars, we must truncate for lookups to work correctly
+  - set_fact:
+      netbiosname: "{{ ansible_hostname[0:15] | upper }}"
+  - set_fact:
+      WORKGROUP: "{{ DOMAIN | regex_replace('^(.*)\\.(.*)', '\\\\1') | upper }}"
+    when: WORKGROUP == "magic"
+
+  - set_fact:
+      ADDOMAIN: "{{ DOMAIN | upper }}"
+    when: ADDOMAIN == "magic"
+
+
+
+  # Set a timeout in case join is in a state where this would prompt for a password
+  - name: Check if already domain joined
+    shell: timeout 5s net ads testjoin
+    register: testjoin_result
+    failed_when: testjoin_result.rc == 0
+    when: JOINAGAIN == "n"
+  
+  - name: Update resolv.conf
+    template: src=templates/resolv.conf.j2 dest=/etc/resolv.conf
+
+
+  - name: Install required packages (Red Hat OS family)
+    command: yum -y install authconfig krb5-workstation ntp openldap-clients samba-common sssd sssd-tools
+    when: ansible_os_family == 'RedHat'
+
+  - name: Refresh package cache (Debian OS family)
+    command: apt-get update
+    when: ansible_os_family == 'Debian'
+
+  - name: Install required packages (Debian OS family)
+    shell: export DEBIAN_FRONTEND=noninteractive; apt-get -y install krb5-user ntp samba-common sssd sssd-tools
+    when: ansible_os_family == 'Debian'
+
+  #- name: Check connectivity
+  #  command: nc -z $(dig -t SRV _ldap._tcp.{{ADDOMAIN}} +short | awk '{print $4}' | head -1) 389
+
+  - name: Create backup location at /root/authbackup
+    file: dest=/root/authbackup state=directory
+    when: ansible_os_family == 'RedHat'
+    register: authbackup_dir
+
+    ## This is how you tell what you can do with a registered variable, leaving here for reference
+    #- name: debug
+    #  debug: var=authbackup_dir
+
+    # We only save a backup if the backup path doesn't already exist to avoid overwriting
+    # a previous backup
+  - name: Save backup of auth config files to /root/authbackup
+    command: /usr/sbin/authconfig --savebackup=/root/authbackup
+    when: ansible_os_family == 'RedHat' and authbackup_dir.changed == true
+
+ # - name: Ensure sssd is stopped
+ #   service: name=sssd state=stopped
+
+    # sss_cache -E doesn't currently work
+  - name: Clear the sssd cache
+    shell: rm -f /var/lib/sss/db/* /var/lib/sss/mc/*
+
+  - name: Make sure ntpd is running (Red Hat OS family)
+    service: name=ntpd state=started enabled=yes
+    when: ansible_os_family == 'RedHat'
+
+  - name: Make sure ntp is running (Debian OS family)
+    service: name=ntp state=started enabled=yes
+    when: ansible_os_family == 'Debian'
+
+    # Make sure conflicting services are stopped
+  - name: Check to see if nslcd exists
+    stat: path=/etc/init.d/nslcd
+    register: nslcd_init
+
+  - name: Stop and disable nslcd
+    service: name=nslcd state=stopped enabled=no
+    when: nslcd_init.stat.exists == true
+
+  - name: Check to see if winbind exists
+    stat: path=/etc/init.d/winbind
+    register: winbind_init
+
+  - name: Stop and disable winbind
+    service: name=winbind state=stopped enabled=no
+    when: winbind_init.stat.exists == true
+
+  - name: Check to see if nscd exists
+    stat: path=/etc/init.d/nscd
+    register: nscd_init
+
+  - name: Stop and disable nscd
+    service: name=nscd state=stopped enabled=no
+    when: nscd_init.stat.exists == true
+
+    # Configure Samba
+  - name: Install smb.conf configuration file
+    template: src=templates/cust-smb.conf.j2 dest=/etc/samba/smb.conf
+
+    # Configure Kerberos
+  - name: Install krb5.conf configuration file
+    template: src=templates/cust-krb5.conf.j2 dest=/etc/krb5.conf
+
+  - name: Get Kerberos ticket
+    shell: echo '{{JOINPWD}}' | kinit {{JOINACCT}}@{{ADDOMAIN}}
+
+  - name: Join to domain
+    command: net ads join -U "{{JOINACCT}}@{{ADDOMAIN}}"%"{{JOINPWD}}"
+
+    # Configure SSSD
+  - name: Install sssd configuration file
+    template: src=templates/cust-sssd.conf.j2 dest=/etc/sssd/sssd.conf mode=0600
+
+
+  #- name: Use Unix UID/GID from AD for legacy accounts
+  #  lineinfile: dest=/etc/sssd/sssd.conf regexp='^ldap_id_mapping' line='ldap_id_mapping = False'
+  #  when: legacy_account|success
+
+  - name: Set UID_MAX to 5000 to avoid conflicts with AD
+    lineinfile: dest=/etc/login.defs regexp=^UID_MAX line='UID_MAX                  5000'
+
+  - name: Set GID_MAX to 5000 to avoid conflicts with AD
+    lineinfile: dest=/etc/login.defs regexp=^GID_MAX line='GID_MAX                  5000'
+
+  - name: Enable sssd service
+    service: name=sssd state=started enabled=yes
+
+  - name: Configure sssd
+    command: /usr/sbin/authconfig --update --enablesssd --enablesssdauth --enablemkhomedir --disableldap --disableldapauth --disablekrb5 --disablewinbind --disablewinbindauth --disablefingerprint
+    when: ansible_os_family == 'RedHat'
+
