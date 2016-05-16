@@ -1,0 +1,22 @@
+[sssd]
+config_file_version = 2
+domains = {{ADDOMAIN}}
+services = nss, pam
+
+[domain/{{ADDOMAIN}}]
+id_provider = ad
+ldap_force_upper_case_realm = true
+ldap_sasl_authid = {{netbiosname}}$@{{ADDOMAIN}}
+fallback_homedir = /home/%u
+override_shell = /bin/bash
+ldap_use_tokengroups = False
+dyndns_update = True
+dns_discovery_domain = {{ADDOMAIN}}
+dyndns_iface =  {{ ansible_default_ipv4.interface }} 
+
+
+{% if ENUMERATE|lower == 'y' %}
+enumerate = true
+{% else %}
+enumerate = false
+{% endif %}

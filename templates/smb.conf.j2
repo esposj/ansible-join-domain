@@ -1,0 +1,12 @@
+[global]
+   security = ads
+   realm = {{ADDOMAIN}}
+   workgroup = {{WORKGROUP}}
+   netbios name = {{netbiosname}}
+
+   log file = /var/log/samba/%m.log
+
+   kerberos method = secrets and keytab
+
+   client signing = yes
+   client use spnego = yes
